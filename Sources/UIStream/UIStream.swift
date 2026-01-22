@@ -84,8 +84,10 @@ public actor UIStream<Member: QueueMember> {
     /// This clears the queue and cancels the current runner (if any), ensuring
     /// that the provided member becomes the next and only item to process.
     /// - Parameter member: The exclusive member to enqueue.
-    public func enqueueExclusively(_ member: Member) {
-        cancelAllInternal()
+    public func enqueueExclusively(_ member: Member) async {
+        // Cancel any current work and wait for the runner to fully finish
+        await self.cancelAllAndWait()
+        // Replace the queue with only this member and start fresh
         queue = [member]
         startRunnerIfNeeded()
     }
@@ -104,8 +106,8 @@ public actor UIStream<Member: QueueMember> {
     ///
     /// If a blocker is currently showing, this ensures a final ``LifecyclePhase/hidden``
     /// event is emitted for a clean lifecycle termination.
-    public func cancelAll() {
-        cancelAllInternal()
+    public func cancelAll() async {
+        await cancelAllAndWait()
     }
 
     /// Start the queue-draining runner task if it is not already running.
@@ -142,17 +144,32 @@ public actor UIStream<Member: QueueMember> {
     /// If cancelled during any wait, ensures a clean end via ``ensureHiddenIfNeeded(for:)``.
     private func run(_ member: Member) async {
         currentlyShowing = member
+        
+        if Task.isCancelled {
+            emit(member, phase: .reject)
+            return
+        }
 
         // animateIn
         emit(member, phase: .animateIn)
         do { try await Task.sleep(for: member.transitionDuration) }
-        catch { await ensureHiddenIfNeeded(for: member); return }
+        catch { await animateOutAndHide(for: member); return }
 
+        if Task.isCancelled {
+            await animateOutAndHide(for: member)
+            return
+        }
+        
         // middle phase
         switch member.memberType {
         case .timed:
             do { try await Task.sleep(for: member.restDuration) }
-            catch { await ensureHiddenIfNeeded(for: member); return }
+            catch { await animateOutAndHide(for: member); return }
+            
+            if Task.isCancelled {
+                await animateOutAndHide(for: member)
+                return
+            }
 
         case .blocker:
             await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
@@ -163,7 +180,13 @@ public actor UIStream<Member: QueueMember> {
         // animateOut
         emit(member, phase: .animateOut)
         do { try await Task.sleep(for: member.transitionDuration) }
-        catch { await ensureHiddenIfNeeded(for: member); return }
+        catch { await animateOutAndHide(for: member); return }
+        
+        if Task.isCancelled {
+            emit(member, phase: .hidden)
+            currentlyShowing = nil
+            return
+        }
 
         // endDelay + hidden
         do { try await Task.sleep(for: member.endDelay) } catch { /* ignore */ }
@@ -176,10 +199,14 @@ public actor UIStream<Member: QueueMember> {
     ///
     /// If the provided member is currently showing, this emits
     /// ``LifecyclePhase/animateOut`` followed by ``LifecyclePhase/hidden``.
-    private func ensureHiddenIfNeeded(for member: Member) async {
+    private func animateOutAndHide(for member: Member) async {
         guard currentlyShowing == member else { return }
-        emit(member, phase: .animateOut)
-        emit(member, phase: .hidden)
+        let task = Task.detached {
+            await self.emit(member, phase: .animateOut)
+            try await Task.sleep(for: member.transitionDuration)
+            await self.emit(member, phase: .hidden)
+        }
+        try? await task.value
         currentlyShowing = nil
     }
 
@@ -190,11 +217,21 @@ public actor UIStream<Member: QueueMember> {
     /// ``LifecyclePhase/hidden``.
     private func cancelAllInternal() {
         runner?.cancel()
-        runner = nil
         queue.removeAll()
-
         // If a blocker is waiting, resume it so run(_:) can finish and emit `.hidden`.
-        blockerContinuation?.resume()
-        blockerContinuation = nil
+        unblock()
+    }
+    
+    /// Cancel all work and wait for the current runner to fully terminate before proceeding.
+    private func cancelAllAndWait() async {
+        // Capture the current runner so we can await it after issuing cancellation.
+        let currentRunner = runner
+        cancelAllInternal()
+        // Clear any pending items as part of an exclusive enqueue or full cancel/replace.
+        queue.removeAll()
+        // Await the previous runner to finish its cleanup (including emitting `.hidden`).
+        if let currentRunner {
+            await currentRunner.value
+        }
     }
 }
